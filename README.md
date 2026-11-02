@@ -1,14 +1,20 @@
-# Intel GPU 空闲功耗技术栈
+# Intel 独立显卡空闲功耗技术栈
+
+[中文](README.md) · **English** → [README.en.md](README.en.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/Heroes-A/intel-gpu-power-stack)](https://github.com/Heroes-A/intel-gpu-power-stack/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20Debian%2012-informational)](docs/01-platform-baseline.md)
 
-**一块装在无头服务器上的英特尔独显，利用率长期为 0，功耗却停在 50 W。把它压到 8 W，靠的不是调参，而是四层结构。**
+**一块装在无头服务器上的英特尔独立显卡（Arc），利用率长期为 0，功耗却停在 50 W。把它压到 8 W，靠的不是调参，而是四层结构。**
 
-> A layered idle-power stack for Intel GPUs on Linux: firmware ASPM L1, kernel residency observability,
-> DRM node relocation, and explicit exposure leases. Reference case: Arc Pro B60, 50.3 W → 8.3 W idle
-> (−83%) with containers still getting the real device.
+> **适用对象：独立显卡（discrete GPU）** —— Intel Arc A 系列（DG2）、B 系列（Battlemage）、
+> Pro 系列（A40/A50/A60/B50/B60）。**核显（iGPU）不适用**，原因见第 11 节。
+>
+> A layered idle-power stack for **Intel Arc discrete GPUs** on Linux: firmware ASPM L1,
+> kernel residency observability, DRM node relocation, and explicit exposure leases.
+> Reference case: Arc Pro B60 (24 GB), 50.3 W → 8.3 W idle (−83%) with containers still
+> getting the real device.
 
 ---
 
@@ -22,8 +28,8 @@
 我花了几天把这件事从"配置问题"追到"结构问题"，结论是：**这不是某一个开关没开，而是四层里每一层都有一个独立的阻塞点**。
 只修其中一层，收益都很小；四层一起修，才有量级变化。
 
-这篇文章把整套东西整理成一个可复用的技术栈，适用于英特尔独显（Arc A 系列 / B 系列 / Pro 系列），
-核显部分单独说明（结论是：不建议对核显做这套）。
+这篇文章把整套东西整理成一个可复用的技术栈，适用于**英特尔独立显卡**（Arc A 系列 / B 系列 / Pro 系列）。
+核显（iGPU）在第 11 节单独说明，结论是：**不要对核显做这套**。
 
 ---
 
