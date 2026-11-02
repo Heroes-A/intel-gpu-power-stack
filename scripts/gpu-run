@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# 通用入口：等价于 b60-run（参考实现沿用 B60 命名，行为与卡型号无关）
+exec "$(cd "$(dirname "$0")" && pwd)/b60-run" "$@"

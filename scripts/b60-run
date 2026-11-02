@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# =============================================================================
+# b60-run —— B60 无感接入启动器（宿主机侧）
+#
+#   默认模式：申请临时租约 → 等 B60 节点出现在 /dev/dri → 跑命令 → 释放租约
+#   直通模式：--direct，不申请租约，命令自己用 /dev/b60/render
+#
+# 设计红线：
+#   · 不搬节点、不碰 /dev/dri、不重启任何服务——搬节点是 b60-guard 的唯一职责
+#   · b60-guard 不可达 → 报错退出非零，绝不自行 fallback 到手工 mv/ln
+#   · 退出码原样透传；EXIT/INT/TERM/HUP 都保证释放租约
+#
+# 用法：
+#   b60-run ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD129 -i in.mp4 out.mp4
+#   b60-run --ttl 1800 vainfo
+#   b60-run --reason "影视转码" ffmpeg ...        # 面板上显示自定义用途
+#   b60-run --direct myapp --render=/dev/b60/render
+#   b60-run --wait 90 -- some-cmd                 # 延长等待节点出现的超时（秒）
+# =============================================================================
+set -uo pipefail
+
+VERSION="1.3"
+
+API="${B60_API:-http://127.0.0.1:41966}"
+WAIT_S="${B60_WAIT:-60}"
+DEFAULT_TTL="900"          # 15 分钟；服务端会夹在 [30, 3600]
+DRI_NODE="${B60_DRI_NODE:-/dev/dri/renderD129}"
+REAL_NODE="${B60_REAL_NODE:-/dev/b60/render}"
+REAL_DEVS="${B60_RENDER_DEVS:-226:129}"   # B60 render 的设备号；用 scripts/b60-detect.sh 查本机值
+
+TTL=""
+REASON=""
+DIRECT=0
+QUIET=0
+# 契约：节点出现后用户命令的启动延时。保持秒级，不做额外 sleep。
+LEASE_ID=""
+CHILD=""
+WD_PID=""
+
+say()  { [ "$QUIET" = 1 ] || printf 'b60-run: %s\n' "$*" >&2; }
+die()  { printf 'b60-run: 错误：%s\n' "$*" >&2; exit 1; }
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+# --- 参数解析 ----------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)   usage ;;
+    -V|--version) echo "b60-run $VERSION"; exit 0 ;;
+    --ttl)       TTL="${2:-}"; [ -n "$TTL" ] || die "--ttl 需要秒数"; shift 2 ;;
+    --ttl=*)     TTL="${1#*=}"; shift ;;
+    --reason)    REASON="${2:-}"; shift 2 ;;
+    --reason=*)  REASON="${1#*=}"; shift ;;
+    --wait)      WAIT_S="${2:-}"; [ -n "$WAIT_S" ] || die "--wait 需要秒数"; shift 2 ;;
+    --api)       API="${2:-}"; shift 2 ;;
+    --direct)    DIRECT=1; shift ;;
+    -q|--quiet)  QUIET=1; shift ;;
+    --)          shift; break ;;
+    -*)          die "未知选项 $1（--help 查看用法）" ;;
+    *)           break ;;
+  esac
+done
+[ $# -gt 0 ] || die "缺少要执行的命令（--help 查看用法）"
+TTL="${TTL:-$DEFAULT_TTL}"
+case "$TTL" in ''|*[!0-9]*) die "--ttl 必须是整数秒" ;; esac
+case "$WAIT_S" in ''|*[!0-9]*) die "--wait 必须是整数秒" ;; esac
+
+# --- 小工具 ------------------------------------------------------------------
+devnum() {  # 打印 major:minor，兼容 coreutils 与无 stat -c 的环境
+  if stat -Lc '%t:%T' "$1" >/dev/null 2>&1; then
+    local h; h=$(stat -Lc '%t:%T' "$1")
+    local maj=$((16#${h%%:*})) min=$((16#${h##*:}))
+    printf '%s:%s' "$maj" "$min"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys;s=os.stat(sys.argv[1]).st_rdev;print("%d:%d"%(os.major(s),os.minor(s)))' "$1"
+  else
+    printf 'unknown'
+  fi
+}
+
+json_esc() { printf '%s' "$1" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+api_call() {  # $1=method $2=path [$3=json]
+  local m="$1" p="$2" body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -sS -m 8 -X "$m" -H 'Content-Type: application/json' -d "$body" "$API$p" 2>&1
+  else
+    curl -sS -m 8 -X "$m" "$API$p" 2>&1
+  fi
+}
+
+dispatch_policy() {  # 从 /api/status 里取 dispatch.policy，取不到就返回空
+  api_call GET /api/status \
+    | sed -n 's/.*"dispatch"[^}]*"policy"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' \
+    | head -1
+}
+
+# --- 租约生命周期 ------------------------------------------------------------
+# 看护子进程：SIGKILL 无法被 trap 捕获，所以另起一个「父进程死亡探测器」——
+# b60-run 被 kill -9 后它变成孤儿，检测到父进程消失就代为释放租约，然后自己退出。
+# 判活不看 kill -0：被 kill -9 的进程在父 shell 里可能长期是僵尸，kill -0 仍然成功，
+# 所以读 /proc/<pid>/status 的 State（Z = 已死），再用 starttime 排除 PID 复用。
+# 另有硬截止时间（TTL+120s），即便判断失手也不会变成永久泄漏的租约。
+proc_starttime() {  # /proc/<pid>/stat 第 22 字段
+  [ -r "/proc/$1/stat" ] || return 1
+  sed -e 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+
+proc_alive() {
+  local p="$1" st
+  [ -n "$p" ] || return 1
+  # 非 Linux（无 /proc）退回 kill -0，仅为可移植性；生产机走下面的精确判据
+  [ -d /proc/1 ] || { kill -0 "$p" 2>/dev/null; return $?; }
+  [ -d "/proc/$p" ] || return 1
+  st=$(sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' "/proc/$p/status" 2>/dev/null | head -1)
+  case "$st" in Z|"") return 1 ;; esac
+  # PID 复用保护：启动时间必须与记录一致（与进程名无关，改名/软链都不影响）
+  if [ -n "${PARENT_START:-}" ]; then
+    [ "$(proc_starttime "$p")" = "$PARENT_START" ] || return 1
+  fi
+  return 0
+}
+
+start_watchdog() {
+  local lid="$1"
+  # 注意：bash 子 shell 里 $PPID 不更新（仍是祖父 PID），必须用 $$ —— 它在子 shell 中
+  # 依然是本脚本的 PID。用 $PPID 会变成盯着调用者的父进程，kill -9 后永远等不到死亡。
+  local me=$$
+  PARENT_START="$(proc_starttime "$me")"
+  (
+    parent="$me"
+    deadline=$(( $(date +%s) + TTL + 120 ))
+    dbg() { [ -n "${B60_DEBUG:-}" ] && printf '%s wd[%s] %s\n' "$(date +%T)" "${BASHPID:-$$}" "$*" >>"${B60_DEBUG_LOG:-/tmp/b60-run-wd.log}"; }
+    dbg "start watch=$parent start=${PARENT_START:-none} ttl=$TTL"
+    while proc_alive "$parent"; do
+      [ "$(date +%s)" -ge "$deadline" ] && { dbg "deadline hit"; break; }
+      dbg "alive parent=$parent"
+      sleep 2
+    done
+    dbg "loop exit, parent gone → release"
+    if ! proc_alive "$parent"; then
+      for i in 1 2 3; do
+        r=$(curl -sS -m 5 -X DELETE "$API/api/lease?id=$lid" 2>&1) && { dbg "released ok: $r"; break; }
+        dbg "release attempt $i failed: $r"
+        sleep 1
+      done
+    fi
+  ) >/dev/null 2>&1 &
+  WD_PID=$!
+}
+
+stop_watchdog() {
+  [ -n "$WD_PID" ] || return 0
+  kill "$WD_PID" 2>/dev/null || true
+  WD_PID=""
+}
+
+release_lease() {
+  stop_watchdog
+  [ -n "$LEASE_ID" ] || return 0
+  local id="$LEASE_ID"
+  LEASE_ID=""
+  api_call DELETE "/api/lease?id=$id" >/dev/null 2>&1 \
+    && say "已释放租约 $id" \
+    || say "警告：租约 $id 释放请求失败，将由 TTL 兜底过期（最长 60 分钟）"
+}
+
+on_exit()  { local rc=$?; release_lease; exit "$rc"; }
+
+on_signal() {  # $1=信号名 $2=约定退出码
+  local sig="$1" code="$2"
+  if [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null; then
+    kill -"$sig" "$CHILD" 2>/dev/null
+    wait "$CHILD" 2>/dev/null
+  fi
+  CHILD=""
+  release_lease
+  exit "$code"
+}
+
+trap on_exit EXIT
+trap 'on_signal INT 130'  INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129'  HUP
+
+# --- 运行用户命令 ------------------------------------------------------------
+run_child() {
+  "$@" &
+  CHILD=$!
+  wait "$CHILD"
+  local rc=$?
+  CHILD=""
+  return $rc
+}
+
+# --- 直通模式 ----------------------------------------------------------------
+if [ "$DIRECT" = 1 ]; then
+  [ -e "$REAL_NODE" ] || die "$REAL_NODE 不存在——b60-guard 未就位或掩藏层异常，请先看面板 $API/"
+  local_dev=$(devnum "$REAL_NODE")
+  say "直通模式：${REAL_NODE}（${local_dev}）· 不申请租约 · 请把该路径作为设备参数传给命令"
+  [ "$local_dev" = "unknown" ] || [ "$local_dev" = "$REAL_DEVS" ] \
+    || say "注意：设备号 $local_dev 与 ${REAL_DEVS} 不同，可能不是 B60"
+  run_child "$@"
+  exit $?
+fi
+
+# --- 默认模式：租约 + 等节点 -------------------------------------------------
+health=$(api_call GET /healthz)
+case "$health" in
+  *'"ok"'*|*'true'*) : ;;
+  *) die "b60-guard 不可达（${API}）。请检查 b60-guard 容器是否在运行；
+        本工具不会绕过它手工搬移节点——那是 b60-guard 的职责。" ;;
+esac
+
+pol=$(dispatch_policy)
+[ "$pol" = "masked" ] && die "策略当前为「强制睡眠」(masked)，租约不会把节点放出来。
+        请在面板切回「自动（按租约）」后重试：$API/"
+
+payload=$(printf '{"ttl":%s,"reason":"%s","who":"b60-run"}' \
+  "$TTL" "$(json_esc "${REASON:-b60-run: $*}")")
+resp=$(api_call POST /api/lease "$payload")
+LEASE_ID=$(printf '%s' "$resp" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+[ -n "$LEASE_ID" ] || die "申请租约失败，响应：$resp"
+say "已申请租约 ${LEASE_ID}（TTL ${TTL}s），等待 $DRI_NODE 出现…"
+start_watchdog "$LEASE_ID"
+
+n=0
+while [ ! -e "$DRI_NODE" ]; do
+  n=$((n+1))
+  [ $n -gt "$WAIT_S" ] && die "等待 $DRI_NODE 超时（${WAIT_S}s）。详见面板事件：$API/api/events"
+  sleep 1
+  # 等的过程中策略被改成 masked 就不必再等了
+  if [ $((n % 5)) = 0 ] && [ "$(dispatch_policy)" = "masked" ]; then
+    die "等待中策略被切为 masked，节点不会出现"
+  fi
+done
+
+got=$(devnum "$DRI_NODE")
+if [ "$got" != "unknown" ] && [ "$got" != "$REAL_DEVS" ]; then
+  say "警告：$DRI_NODE 设备号为 ${got}，与 B60 的 ${REAL_DEVS} 不符——命令可能用不到真卡"
+fi
+say "节点就绪（${got}），执行：$*"
+
+run_child "$@"
+rc=$?
+release_lease
+exit $rc
