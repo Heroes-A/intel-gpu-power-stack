@@ -1,5 +1,9 @@
 # Intel GPU 空闲功耗技术栈
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/Heroes-A/intel-gpu-power-stack)](https://github.com/Heroes-A/intel-gpu-power-stack/releases)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20Debian%2012-informational)](docs/01-platform-baseline.md)
+
 **一块装在无头服务器上的英特尔独显，利用率长期为 0，功耗却停在 50 W。把它压到 8 W，靠的不是调参，而是四层结构。**
 
 > A layered idle-power stack for Intel GPUs on Linux: firmware ASPM L1, kernel residency observability,
