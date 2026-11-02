@@ -1,5 +1,7 @@
 # 04 · 节点掩藏：为什么搬 `/dev` 就能省电
 
+> English: [04 · Node masking: why moving /dev saves power](en/04-node-masking.md)
+
 > 这是整个项目里最"不像技术"的一步：把两个设备节点挪个位置，功耗从 42 W 掉到 8 W。
 > 但它有明确的因果链，也有明确的边界。
 

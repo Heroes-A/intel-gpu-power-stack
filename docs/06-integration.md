@@ -1,5 +1,7 @@
 # 06 · 接入指南
 
+> English: [06 · Integration guide](en/06-integration.md)
+
 > 目标：新装一个要 GPU 的东西，不需要理解前面四章，照抄两行配置就能用。
 > 用完也不需要"关掉"什么——它自己回睡。
 

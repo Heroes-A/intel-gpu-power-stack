@@ -1,5 +1,7 @@
 # 01 · 平台、拓扑与基线
 
+> English: [01 · Platform, topology and baseline](en/01-platform-baseline.md)
+
 > 所有数字来自同一台机器、同一次开机周期内的连续测量。
 > 换了主板/BIOS 版本，绝对值会变，但结论的方向一般不变。
 

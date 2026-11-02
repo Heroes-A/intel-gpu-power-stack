@@ -1,5 +1,7 @@
 # 05 · 租约与策略机
 
+> English: [05 · Leases and the policy machine](en/05-lease-policy.md)
+
 > 上一章解决了"平时省电"，这一章解决"要用的时候怎么拿到卡"。  
 > 答案不是拦截 `open()`，而是**在 `open()` 之前就把决定做完**。
 

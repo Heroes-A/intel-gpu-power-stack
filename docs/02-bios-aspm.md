@@ -1,5 +1,7 @@
 # 02 · BIOS / ASPM 设置
 
+> English: [02 · BIOS / ASPM settings](en/02-bios-aspm.md)
+
 > 目标：让 CPU 直连根端口具备并启用 PCIe ASPM L1，使整卡空载从 50.3 W 降到 42 W 量级。
 > 这一步是本项目的**前置条件**——不做这步，后面的节点掩藏只能拿到很小一部分收益。
 

@@ -1,5 +1,7 @@
 # 08 · 技术栈与选型
 
+> English: [08 · Tech stack and component choices](en/08-tech-stack.md)
+
 > 这一篇是给"要改它/要评估它"的人看的：用了什么、为什么用、为什么不用更炫的方案。
 
 ## 1. 全景
@@ -126,4 +128,4 @@ docker run -d --name b60-guard \
 
 ---
 
-← [07 测量方法](07-measurement.md) · 回到 [README](../README.md)
+← [07 测量方法](07-measurement.md) · 回到 [README](../README.zh.md)

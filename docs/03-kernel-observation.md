@@ -1,5 +1,7 @@
 # 03 · 内核侧观测
 
+> English: [03 · Kernel-side observation](en/03-kernel-observation.md)
+
 > 这一篇只讲"怎么看到真相"。
 > 后面所有判断都建立在这几个文件上；读错它们会得出完全相反的结论。
 

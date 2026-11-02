@@ -1,65 +1,70 @@
-# Intel 独立显卡空闲功耗技术栈
+# Idle Power Stack for Intel Discrete GPUs
 
-[中文](README.md) · **English** → [README.en.md](README.en.md)
+**English** · [中文](README.zh.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/Heroes-A/intel-gpu-power-stack)](https://github.com/Heroes-A/intel-gpu-power-stack/releases)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20Debian%2012-informational)](docs/01-platform-baseline.md)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20Debian%2012-informational)](docs/en/01-platform-baseline.md)
 
-**一块装在无头服务器上的英特尔独立显卡（Arc），利用率长期为 0，功耗却停在 50 W。把它压到 8 W，靠的不是调参，而是四层结构。**
+**An Intel Arc discrete GPU in a headless server sits at 0% utilization and still draws 50 W. Getting it to 8 W is not a matter of tweaking a setting — it takes four layers.**
 
-> **适用对象：独立显卡（discrete GPU）** —— Intel Arc A 系列（DG2）、B 系列（Battlemage）、
-> Pro 系列（A40/A50/A60/B50/B60）。**核显（iGPU）不适用**，原因见第 11 节。
+> **Scope: discrete GPUs (dGPU).** Intel Arc A-series (DG2), B-series (Battlemage), and
+> Pro-series (A40/A50/A60/B50/B60). **Integrated GPUs (iGPU) are out of scope** — see §11.
 >
-> A layered idle-power stack for **Intel Arc discrete GPUs** on Linux: firmware ASPM L1,
-> kernel residency observability, DRM node relocation, and explicit exposure leases.
-> Reference case: Arc Pro B60 (24 GB), 50.3 W → 8.3 W idle (−83%) with containers still
+> Reference case: Arc Pro B60 (24 GB), 50.3 W → 8.3 W idle (−83%), with containers still
 > getting the real device.
 
 ---
 
-## 0. 这篇帖子解决什么问题
+## 0. What this post solves
 
-场景很具体：一台 headless Linux 服务器（NAS / 推理机 / 转码机），插一张英特尔 Arc 独显，
-只服务容器里的推理、转码、渲染任务。平均利用率接近 0。
+The scenario is narrow and concrete: a headless Linux box (NAS, inference node, transcoding
+server) with an Intel Arc discrete GPU, serving only containerized inference / transcoding /
+rendering workloads. Average utilization is near zero.
 
-按常理，显卡空载就该掉到个位数瓦。实际上它长期停在 50 W 上下，风扇不转、负载为零、功耗却不降。
+Conventional wisdom says an idle GPU should drop to single-digit watts. In practice it sat at
+~50 W: fan off, zero load, power unchanged.
 
-我花了几天把这件事从"配置问题"追到"结构问题"，结论是：**这不是某一个开关没开，而是四层里每一层都有一个独立的阻塞点**。
-只修其中一层，收益都很小；四层一起修，才有量级变化。
+I spent a few days tracing this from "a configuration problem" to "a structural problem". The
+conclusion: **it is not one switch left off. Each of four layers has its own independent
+blocker.** Fixing one layer buys very little; fixing all four is what produces the order-of-
+magnitude change.
 
-这篇文章把整套东西整理成一个可复用的技术栈，适用于**英特尔独立显卡**（Arc A 系列 / B 系列 / Pro 系列）。
-核显（iGPU）在第 11 节单独说明，结论是：**不要对核显做这套**。
+This post turns the whole thing into a reusable stack for Intel discrete GPUs. Integrated
+GPUs are addressed separately (§11), and the conclusion there is: don't do this to an iGPU.
 
 ---
 
-## 1. 先看结果
+## 1. Results first
 
-同一台机器、同一次开机周期内的连续测量：
+Same machine, continuous measurements within a single boot cycle:
 
-| 阶段 | 动作 | 整卡空载 | L1 链路驻留 |
+| Stage | Action | Whole-card idle | L1 link residency |
 |---|---|---|---|
-| 基线 | 出厂状态 | 50.3 W | 0 % |
-| ① 固件 | BIOS 开 PEG ASPM = L1，交给 BIOS 管链路 | 42.1 W | 具备能力，但被服务轮询打断 |
-| ② 节点 | `card0` / `renderD*` 移出 `/dev/dri` | 31.2 W * | 间歇 |
-| ③ 稳定 | 系统服务不再持有旧 fd、不再轮询 | **8.0 – 8.7 W** | **92 – 99.9 %** |
+| Baseline | Factory state | 50.3 W | 0 % |
+| ① Firmware | BIOS: PEG ASPM = L1, let firmware own the link | 42.1 W | Capable, but broken up by service polling |
+| ② Nodes | `card0` / `renderD*` moved out of `/dev/dri` | 31.2 W * | Intermittent |
+| ③ Settled | System services no longer hold stale fds or poll | **8.0 – 8.7 W** | **92 – 99.9 %** |
 
-\* 掩藏刚生效时有过渡读数：服务仍持有旧 fd，要等它下一次枚举才发现设备不见了。
+\* There is a transition period right after masking: services still hold the old fd and only
+notice the device is gone on their next enumeration.
 
-- 相对基线降幅 **83%**，年化省电约 **370 kWh**（按 42 W × 8760 h 计）。
-- 降幅不是均匀的：固件层只拿 16%，后 80% 全在"系统服务别再碰它"这一步。
+- **83%** below baseline, roughly **370 kWh/year** saved (at 42 W × 8760 h).
+- The drop is not uniform: firmware buys 16%; the remaining 80% all comes from "stop letting
+  system services touch it".
 
-**注意一个容易误判的地方**：浅睡（链路进 L1、封装未深睡）时，24 GB 显存自刷新会撑住约 15.6 W 的地板；
-只有整卡进深睡，读数才落到 8 W 量级。所以"L1 驻留率"和"整卡功耗"必须一起看，
-单看任何一个都会得出相反结论。
+**One easy misread**: in shallow sleep (link in L1, package not deep-asleep), 24 GB of VRAM
+self-refresh holds a floor of ~15.6 W. Only when the whole card reaches deep sleep does the
+reading fall to the 8 W range. So **L1 residency and whole-card power must be read together** —
+either one alone leads to the opposite conclusion.
 
 ---
 
-## 2. 为什么英特尔独显的待机功耗会卡住
+## 2. Why Intel dGPU idle power gets stuck
 
-拆开看是三层，彼此独立：
+It decomposes into three independent layers.
 
-### 2.1 固件层：根端口根本没有 L1 能力
+### 2.1 Firmware: the root port has no L1 capability at all
 
 ```
 $ sudo lspci -s 00:01.0 -vv | grep LnkCap
@@ -68,177 +73,197 @@ LnkCap: Port #0, Speed 16GT/s, Width x16
                 ^^^^^^^^^^^^^^^^
 ```
 
-根端口的 `LnkCap` 里直接写着 `ASPM not supported`。同时 `dmesg` 会有：
+The root port's `LnkCap` literally says `ASPM not supported`. Meanwhile `dmesg` shows:
 
 ```
 ACPI FADT declares the system doesn't support PCIe ASPM, so disable it
 ```
 
-两个信号叠在一起，内核就完全不接管 ASPM 了。而主板 BIOS 里 `PEG ASPM` 这一项默认是 `Auto` 或 `Disabled`，
-所以链路永远停在 L0——每一毫秒都在满速供电。
+Two signals stacked, and the kernel never takes over ASPM. On the motherboard side,
+`PEG ASPM` defaults to `Auto` or `Disabled`, so the link stays in L0 forever — full-power
+delivery every millisecond.
 
-这一步是**前置条件**。不开它，后面所有工作最多拿到 1/5 的收益。
+This is a **precondition**. Without it, everything downstream buys at most 1/5 of the total.
 
-### 2.2 系统服务层：周期性 MMIO 轮询是真正的杀手
+### 2.2 System services: periodic MMIO polling is the real killer
 
-这是最反直觉的一点，也是我一开始判错的地方。
+This is the most counter-intuitive part, and where I got it wrong first.
 
-我以为是"容器开着设备所以链路睡不下去"，于是做了对照实验：`docker pause` 冻结容器全部线程，
-功耗三态（跑 / 暂停 / 停止）完全一致。**持卡不阻塞 L1。**
+I assumed "the container holds the device, so the link can't sleep", and ran a control
+experiment: `docker pause` freezes every thread in the container. Power was identical across
+all three states (running / paused / stopped). **Holding the device does not block L1.**
 
-真正把链路拽出来的是**周期性寄存器读**。NAS 面板类系统服务（系统信息、资源监控、媒体服务）
-每隔几秒枚举一次 `/dev/dri`，发现设备就打开节点、读一次 MMIO 寄存器报告温度/显存/利用率。
-每一次读都是一次链路唤醒，链路在 L1 里待不到两个周期就被叫醒。
+What actually drags the link out is **periodic register reads**. NAS-dashboard-style services
+(system info, resource monitor, media service) enumerate `/dev/dri` every few seconds, open the
+node they find, and read an MMIO register to report temperature / VRAM / utilization. Every read
+is a link wake-up; the link cannot stay in L1 for two full poll periods.
 
-实测：这类服务活着的时候，L1 驻留率始终上不去；把它们要看的节点挪走，驻留率直接跳到 99%。
+Measured: with those services running, L1 residency never climbs. Move the nodes they look for
+out of the way, and residency jumps straight to 99%.
 
-### 2.3 架构层：显存自刷新构成硬地板
+### 2.3 Architecture: VRAM self-refresh is a hard floor
 
-独显有独立 VRAM，进入浅睡时显存必须保持自刷新，这部分功耗收不回来。
+A discrete GPU has dedicated VRAM. In shallow sleep the VRAM must keep self-refreshing, and
+that power cannot be recovered.
 
-- 24 GB 的卡，浅睡地板约 **15.6 W**；
-- 只有整卡进深睡（D3cold / 封装 G2 以上），读数才落到 8 W 量级。
+- On a 24 GB card the shallow-sleep floor is about **15.6 W**.
+- Only deep sleep on the whole card (D3cold / package state G2 or deeper) brings the reading
+  down to the 8 W range.
 
-这解释了一个常见困惑："为什么别人同款卡空载只有 15 W，我这儿 40 W？"
-——因为 15 W 就是它的浅睡地板，不是它省得好。要过这条线，必须让链路真的睡下去。
+This explains a common confusion: "why does the same card idle at 15 W for other people while
+mine sits at 40 W?" — because 15 W *is* its shallow-sleep floor; it isn't better optimized. To
+cross that line, the link has to genuinely sleep.
 
-### 2.4 接入层（工程问题，非功耗问题）
+### 2.4 Access layer (an engineering problem, not a power problem)
 
-节点挪走之后，新装的容器和脚本找不到卡了。这是"节点掩藏"方案自带的代价，
-必须用接入层补回来，否则方案不可持续。
+Once the nodes are moved, newly installed containers and scripts can't find the card. That is
+the built-in cost of node masking, and it has to be paid back with an access layer or the
+approach doesn't survive.
 
 ---
 
-## 3. 技术栈：六层
+## 3. The stack: six layers
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ L5 观测   内嵌面板 · 自适应采样 · 时序库 · 事件流                 │
+│ L5 Observe   embedded dashboard · adaptive sampling · time series │
 ├──────────────────────────────────────────────────────────────────┤
-│ L4 接入   容器 devices 直通 · 租约启动器 · 接入自检               │
+│ L4 Access    container device passthrough · lease runner · check  │
 ├──────────────────────────────────────────────────────────────────┤
-│ L3 控制   单容器控制面：策略机 · 租约 · 污染看门狗 · 消费者画像    │
+│ L3 Control   single-container control plane: policy · leases ·    │
+│              pollution watchdog · consumer profiling              │
 ├──────────────────────────────────────────────────────────────────┤
-│ L2 节点   /dev/dri ⇄ 私有目录 rename（不是代理、不是软链）         │
+│ L2 Nodes     /dev/dri ⇄ private dir rename (not a proxy, not a    │
+│              symlink)                                             │
 ├──────────────────────────────────────────────────────────────────┤
-│ L1 内核   xe / i915 · PCIe ASPM · runtime PM · debugfs · hwmon    │
+│ L1 Kernel    xe / i915 · PCIe ASPM · runtime PM · debugfs · hwmon │
 ├──────────────────────────────────────────────────────────────────┤
-│ L0 固件   BIOS：PEG ASPM = L1 · Native ASPM = Disabled            │
+│ L0 Firmware  BIOS: PEG ASPM = L1 · Native ASPM = Disabled         │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-| 层 | 组件 | 职责 | 是否新写 |
+| Layer | Component | Responsibility | New code? |
 |---|---|---|---|
-| L0 | 主板 BIOS | 让根端口具备 L1 能力，且由 BIOS 而非内核配置链路 | 否 |
-| L1 | 内核 + 驱动 | 真实电源管理；提供驻留/能耗观测接口 | 否 |
-| L2 | `mv`（rename） | 决定系统服务能否枚举到设备 | 否 |
-| L3 | FastAPI + SQLite 单容器 | 策略、租约、看门狗、采样 | **是**，几百行 |
-| L4 | Docker `devices:` + 两个 bash 脚本 | 无感接入、租约兜底 | **是**，纯 bash |
-| L5 | 服务端直出的 HTML/JS | 看曲线、看驻留、看谁在持卡 | **是**，无构建 |
+| L0 | Motherboard BIOS | Give the root port L1 capability; let firmware, not the kernel, configure the link | No |
+| L1 | Kernel + driver | Real power management; expose residency / energy counters | No |
+| L2 | `mv` (rename) | Decide whether system services can enumerate the device | No |
+| L3 | FastAPI + SQLite in one container | Policy, leases, watchdog, sampling | **Yes**, a few hundred lines |
+| L4 | Docker `devices:` + two bash scripts | Frictionless access, lease fallback | **Yes**, pure bash |
+| L5 | Server-rendered HTML/JS | Curves, residency, who holds the card | **Yes**, no build step |
 
-整套东西没有引入任何重型组件：外部依赖只有 `fastapi` + `uvicorn` 两个 pip 包，
-其余全部复用内核既有能力。没有 Prometheus、没有 Grafana、没有前端构建链。
+Nothing heavy is introduced: the only external dependencies are two pip packages
+(`fastapi` + `uvicorn`); everything else reuses existing kernel capability. No Prometheus, no
+Grafana, no frontend build chain.
 
 ---
 
-## 4. L0 · 固件：ASPM 的通用打法
+## 4. L0 · Firmware: the general ASPM playbook
 
-### 4.1 目标状态
+### 4.1 Target state
 
-| 项目 | 目标值 | 为什么 |
+| Item | Target | Why |
 |---|---|---|
-| PCIe Native Power Management | Enabled | 打开这一页的电源管理能力 |
-| Native ASPM | **Disabled** | 让 BIOS 管链路（FADT 模式）。OS 接管路径在实测平台上从未走通 |
-| PEG ASPM（CPU 直连槽） | **L1** | 只要 L1，L0s 只增加无谓的进出态开销 |
-| PCH ASPM / DMI ASPM | Disabled | 与目标无关，只增风险 |
-| L1 Substates（L1.1 / L1.2） | **Disabled** | 实测会导致 POST 阶段全黑 + 断网，须 Clear CMOS 才能救回 |
+| PCIe Native Power Management | Enabled | Unlocks the power features on this page |
+| Native ASPM | **Disabled** | Lets BIOS own the link (FADT mode). The OS-takeover path never worked on the test platform |
+| PEG ASPM (CPU-attached slot) | **L1** | L1 only; L0s just adds needless entry/exit overhead |
+| PCH ASPM / DMI ASPM | Disabled | Irrelevant to the goal, adds risk |
+| L1 Substates (L1.1 / L1.2) | **Disabled** | Measured to cause a black screen at POST plus loss of network; needs Clear CMOS to recover |
 
-### 4.2 厂商菜单对照
+### 4.2 Vendor menu names
 
-不同主板叫法不一样，找这几个关键词：
+Names differ by vendor. Look for these keywords:
 
-| 厂商 | 路径（Advanced Mode） | 关键项名 |
+| Vendor | Path (Advanced Mode) | Key items |
 |---|---|---|
 | ASUS | Advanced → Platform Misc Configuration | `PEG ASPM` / `Native ASPM` / `PCI Express Native Power Management` |
 | MSI | Settings → Advanced → PCI Subsystem Settings | `PCIe ASPM` / `PEG ASPM` |
 | ASRock | Advanced → Chipset → PCI Express Config | `PCIe ASPM Support` / `PEG ASPM` |
 | Gigabyte | Settings → Platform Power / Peripherals | `PCIe ASPM Mode` / `PEG ASPM` |
 
-> 部分主板把 PEG ASPM 藏在 `Advanced → System Agent (SA) → PCI Express Configuration` 下。
-> 找不到就全页搜 `ASPM`。
+> Some boards hide PEG ASPM under `Advanced → System Agent (SA) → PCI Express Configuration`.
+> If you can't find it, search the whole page for `ASPM`.
 
-### 4.3 操作纪律（这几条比设置本身重要）
+### 4.3 Operating discipline (more important than the settings)
 
-1. **先设"来电自启"**（Restore AC Power Loss = Power On）。之后任何设置导致起不来，远程断电再上电还有一次自恢复机会。
-2. **一次只改一项**，改 → 存 → 冷启 → 验证 → 再改下一项。否则出问题无法归因。
-3. **关掉 OS 内 `reboot`**。Battlemage（B 系列）热复位后链路重训练窗口不足，
-   任何软复位都会黑屏挂死。标准流程：F10 → 黑屏（**预期**）→ 断电 ≥10 秒 → 上电。
-   A 系列（DG2）一般没这么严重，但同样建议走冷启。
+1. **Set "Restore AC Power Loss = Power On" first.** Then if any change bricks the boot,
+   a remote power cycle still gives you one self-recovery attempt.
+2. **Change one item at a time**: change → save → cold boot → verify → next. Otherwise you
+   can't attribute a failure.
+3. **Never `reboot` from the OS.** After a warm reset, Battlemage (B-series) has too short a
+   link retraining window; any soft reset hangs to a black screen. Standard procedure: F10 →
+   black screen (**expected**) → cut power ≥10 s → power on. A-series (DG2) is usually less
+   severe, but cold boot is still recommended.
 
-### 4.4 验收五连
+### 4.4 The five-point acceptance check
 
 ```bash
-# 1. FADT 那句会保留 —— 这是设计，不是失败
+# 1. The FADT line stays — that's by design, not a failure
 sudo dmesg | grep -i 'FADT.*ASPM'
-#    Native ASPM=Disabled 就是"BIOS 管 ASPM"，FADT 继续声明 unsupported 属正常
+#    Native ASPM=Disabled means "BIOS owns ASPM"; FADT still declaring unsupported is normal
 
-# 2. 根端口能力位出现 ASPM L1（不再是 not supported）
+# 2. Root port capability now shows ASPM L1 (no longer "not supported")
 sudo lspci -s 00:01.0 -vv | grep -E 'LnkCap|LnkCtl'
 
-# 3. 上游 LnkCtl 变 Enabled
+# 3. Upstream LnkCtl flips to Enabled
 sudo lspci -s 01:00.0 -vv | grep LnkCtl
 
-# 4. L1 驻留开始增长（间隔 10 s 读两次，第二次应大于第一次）
+# 4. L1 residency starts growing (read twice, 10 s apart; second > first)
 D=/sys/kernel/debug/dri/0000:03:00.0
 sudo cat $D/*residenc* 2>/dev/null; sleep 10; sudo cat $D/*residenc* 2>/dev/null
 
-# 5. 功耗复测（20 s 能量差分）
+# 5. Re-measure power (20 s energy delta)
 E1=$(cat /sys/class/hwmon/hwmon*/energy1_input | head -1); sleep 20
 E2=$(cat /sys/class/hwmon/hwmon*/energy1_input | head -1)
 awk "BEGIN{printf \"card = %.1f W\n\", ($E2-$E1)/20e6}"
 ```
 
-判据 2 不过 = BIOS 没吃设置；判据 2 过、3 不过 = PEG ASPM 还是 `Auto` 而不是 `L1`；
-1–4 过但功耗没降 = 链路通了、封装态没进，保留现状继续往下走。
+Check 2 failing = BIOS didn't take the setting. Check 2 passing but 3 failing = PEG ASPM is
+still `Auto` rather than `L1`. Checks 1–4 passing but power unchanged = link is fine, package
+state isn't entering; keep going to the next layers.
 
 ---
 
-## 5. L1 · 内核：只信这四个接口
+## 5. L1 · Kernel: trust only these four interfaces
 
-网上关于"怎么测 GPU 功耗"的说法大半是错的。真正能给出因果关系的只有四个口：
+Most online advice about "how to measure GPU power" is wrong. Only four interfaces give you
+causality:
 
-| 接口 | 路径 | 它能回答什么 |
+| Interface | Path | What it answers |
 |---|---|---|
-| 链路驻留 | `debugfs/dri/<BDF>/*residenc*` | 链路有多少时间真睡在 L1 —— **最重要的单一指标** |
-| 封装态 | `debugfs/dri/<BDF>/*pkg*residenc*` | 是否进到更深封装态（决定能不能突破显存地板） |
-| 能量计数器 | `hwmon*/energy{1,2}_input`（微焦） | 整卡 / 封装两个域的累计能耗，差分即均值 |
-| 客户端列表 | `debugfs/dri/<BDF>/clients` + `/proc/<pid>/fdinfo/*` | 谁开着设备、是"仅识别"还是"在干活" |
+| Link residency | `debugfs/dri/<BDF>/*residenc*` | How much time the link actually spends in L1 — **the single most important metric** |
+| Package state | `debugfs/dri/<BDF>/*pkg*residenc*` | Whether a deeper package state is reached (decides if you can beat the VRAM floor) |
+| Energy counters | `hwmon*/energy{1,2}_input` (µJ) | Cumulative energy for card / package domains; difference = mean power |
+| Client list | `debugfs/dri/<BDF>/clients` + `/proc/<pid>/fdinfo/*` | Who holds the device, and whether they merely *enumerate* or actually *work* |
 
-几个必须知道的坑：
+Traps you must know:
 
-- **`hwmon` 编号不稳定**，用 `grep -l . /sys/class/hwmon/hwmon*/energy1_input` 找有计数器的那个。
-- **能量计数器更新粒度约 100 ms**，所以 100 ms 差分会在 0 – 5.4 J 之间乱跳（等效 0 – 54 W）。
-  用 15 s 以上的区间差分，读数才稳定。
-- **debugfs 文件名随驱动/内核版本变化**：`xe` 下是 `dgfx_pcie_link_residencies` / `dgfx_pkg_residencies`；
-  `i915` 或其他版本可能是别的名字。**用 glob 找，别写死**。
-- **`fdinfo` 里的 `drm-engine-*` 才是"真在干活"的证据**。一个进程开着节点但引擎计数为 0，就是"仅识别"。
+- **`hwmon` numbering is not stable.** Find the one with a counter:
+  `grep -l . /sys/class/hwmon/hwmon*/energy1_input`.
+- **Energy counters update at ~100 ms granularity**, so a 100 ms delta jumps between 0 and
+  5.4 J (equivalent to 0–54 W). Use deltas of 15 s or more for a stable reading.
+- **debugfs filenames vary by driver/kernel version**: under `xe` they are
+  `dgfx_pcie_link_residencies` / `dgfx_pkg_residencies`; `i915` or other versions may differ.
+  **Glob for them, don't hardcode.**
+- **`drm-engine-*` in `fdinfo` is the proof of real work.** A process that has the node open
+  but shows zero engine time is merely enumerating.
 
 ---
 
-## 6. L2 · 节点：为什么搬 `/dev` 就能省电
+## 6. L2 · Nodes: why moving `/dev` saves power
 
-这一步看起来最不像技术，但它有明确的因果链：
+This looks like the least technical step, but it has a clear causal chain:
 
 ```
-系统服务每 N 秒枚举 /dev/dri
+System service enumerates /dev/dri every N seconds
         │
-        ├── 看得到卡 → 打开节点 → 周期性 MMIO 读寄存器
-        │                              └─ 每次读 = 一次链路唤醒 → L1 待不住
+        ├── card visible → open node → periodic MMIO register reads
+        │                                └─ each read = a link wake-up → L1 can't hold
         │
-        └── 看不到卡 → 什么也不做 → 链路自己睡进 L1 → 8 W
+        └── card invisible → does nothing → link sleeps into L1 on its own → 8 W
 ```
 
-实现只是两个 `mv`（同分区 rename，不改变 inode / 权限 / 设备号，已打开的 fd 不受影响）：
+The implementation is two `mv`s (same-filesystem rename; inode, permissions and device number
+are unchanged, already-open fds are unaffected):
 
 ```bash
 sudo mkdir -p /dev/gpu
@@ -246,67 +271,74 @@ sudo mv /dev/dri/card0      /dev/gpu/card
 sudo mv /dev/dri/renderD129 /dev/gpu/render
 ```
 
-容器改成直挂 `/dev/gpu/render`，完全不受影响——**它拿到的是同一个 inode、同一个设备号、同一张真卡**。
+Containers then mount `/dev/gpu/render` directly and are unaffected — **same inode, same device
+number, same real card.**
 
-### 6.1 适用边界（很重要）
+### 6.1 Applicability (important)
 
-| 情况 | 是否适用 | 说明 |
+| Situation | Applies? | Note |
 |---|---|---|
-| NAS / 面板类服务周期性枚举 GPU | ✅ 收益最大 | 这是主要场景 |
-| 只有容器用卡，系统层不碰 | ✅ 收益中等 | 只拿到固件层那部分 |
-| 系统级任务（相册 AI、影视转码）必须用卡 | ⚠️ 需要租约 | 它们只认 `/dev/dri`，要用时得临时暴露 |
-| 有图形会话 / 显示器接在卡上 | ❌ 不要做 | 拔掉节点等于拔掉显示 |
-| 核显（共享内存，无独立 VRAM） | ❌ 不建议 | 收益极小，且 `/dev/dri` 被显示栈深度依赖 |
+| NAS / dashboard services periodically enumerate the GPU | ✅ Biggest win | The primary scenario |
+| Only containers use the card; system layer never touches it | ✅ Moderate win | You only get the firmware part |
+| System-level tasks (photo AI, media transcoding) need the card | ⚠️ Needs leases | They only look in `/dev/dri`; expose on demand |
+| Graphical session / monitor attached to the card | ❌ Don't | Removing the node removes the display |
+| Integrated GPU (shared memory, no dedicated VRAM) | ❌ Not advised | Negligible gain, and `/dev/dri` is deeply depended on by the display stack |
 
-### 6.2 一个必须说清楚的事实：假节点做不出来
+### 6.2 A fact worth stating plainly: you cannot fake a node
 
-我试过"造一个假设备骗过系统层"的路子，三条路全堵死：
+I tried the "invent a fake device to fool the system layer" route. All three paths are closed:
 
-1. **CUSE 假 DRM 节点** —— DRM 离不开 `mmap`，CUSE 不支持 `mmap`，第一次 `mmap` 就崩。
-2. **伪造 `/sys/class/drm/` 条目** —— sysfs 由内核生成，用户态写不进去。
-3. **伪造 `/dev` 节点** —— `libdrm` 的 `drmGetDevices2()` 会拿 `stat()` 的 `st_rdev`
-   和 udev 记录的 `devnum` 比对，对不上直接过滤掉。
+1. **CUSE fake DRM node** — DRM requires `mmap`; CUSE doesn't support `mmap`; it dies on the
+   first `mmap`.
+2. **Forged `/sys/class/drm/` entries** — sysfs is kernel-generated; userspace can't write it.
+3. **Forged `/dev` node** — `libdrm`'s `drmGetDevices2()` compares `stat()`'s `st_rdev` against
+   the udev-recorded `devnum` and filters out mismatches.
 
-所以正确形态不是"骗"，而是**路径重定向 + 显式租约**：平时让系统服务看不见，需要时明确地说"现在给你 30 分钟"。
+So the correct shape is not deception but **path redirection plus explicit leases**: hide from
+system services by default, and say "you have 30 minutes, starting now" when they need it.
 
 ---
 
-## 7. L3 · 控制面：两个状态 + 租约
+## 7. L3 · Control plane: two states plus leases
 
-### 7.1 状态机
+### 7.1 State machine
 
-| 状态 | 节点位置 | 系统服务可见 | 功耗 | 谁在用 |
+| State | Node location | Visible to system services | Power | Who uses it |
 |---|---|---|---|---|
-| `SLEEP` | `/dev/gpu/{card,render}` | ✗ | ~8 W | 容器（直通路径，随时可用） |
-| `WORK` | `/dev/dri/{card,renderD*}` | ✓ | ~42 W | 系统级任务 + 容器 |
+| `SLEEP` | `/dev/gpu/{card,render}` | ✗ | ~8 W | Containers (direct path, always available) |
+| `WORK` | `/dev/dri/{card,renderD*}` | ✓ | ~42 W | System-level tasks + containers |
 
-关键设计：**容器在两种状态下都能用卡**。切换的从来只有一件事——系统服务能不能看到它。
-所以"要用 GPU"这个动作对容器是零成本的，不需要申请租约；只有系统级任务才需要。
+Key design point: **containers can use the card in both states.** The only thing that ever
+switches is whether system services can see it. So "I need the GPU" costs a container nothing
+and needs no lease; only system-level tasks do.
 
-### 7.2 租约
+### 7.2 Leases
 
 ```
-POST   /api/lease  {"reason":"影视转码","ttl":1800}   → 切 WORK，返回 lease id
-DELETE /api/lease/<id>                                → 切回 SLEEP
+POST   /api/lease  {"reason":"media transcode","ttl":1800}   → switch to WORK, return lease id
+DELETE /api/lease/<id>                                        → switch back to SLEEP
 ```
 
-- **TTL 兜底**：到期自动回收，防止"忘了释放"把机器钉在 42 W。
-- **防抖**：切换有 15 s 防抖窗口，避免频繁抖动。
-- **孤儿看门狗**：调用方被 `kill -9` 时，独立看护进程读 `/proc/<pid>/status` 判活并代释放（含 PID 复用保护）。
+- **TTL fallback**: auto-reclaim on expiry, so a forgotten release can't pin the box at 42 W.
+- **Debounce**: a 15 s debounce window around transitions prevents flapping.
+- **Orphan watchdog**: when the caller is `kill -9`'d, an independent process checks
+  `/proc/<pid>/status` for liveness and releases on its behalf (with PID-reuse protection).
 
-### 7.3 污染看门狗
+### 7.3 Pollution watchdog
 
-节点虽然挪走了，但可能有人手工把它挪回来，或者某个服务缓存了路径。
-看门狗持续看 L1 驻留率：连续 3 个采样周期低于 40% 就判定"被污染"，
-自动重新掩藏并重启相关服务，同时记一条事件。
+Even with nodes moved, someone may move them back by hand, or a service may cache the path.
+The watchdog tracks L1 residency continuously: three consecutive sample periods below 40% is
+treated as pollution, triggering automatic re-masking plus a restart of the affected services,
+and an event is recorded.
 
 ---
 
-## 8. L4 · 接入：让新装的东西无感
+## 8. L4 · Access: making new installs transparent
 
-这是整套方案能不能长期活下去的关键。节点挪走之后，接入只有两条路：
+This is what decides whether the approach survives long term. With nodes moved, there are only
+two access paths:
 
-**容器（推荐，零延迟）**
+**Containers (recommended, zero latency)**
 
 ```yaml
 services:
@@ -315,198 +347,219 @@ services:
       - /dev/gpu/render:/dev/dri/renderD129
 ```
 
-挂进去的仍然是真卡，`vainfo` / `sycl-ls` / OpenVINO 全部正常。**不需要暴露，不需要等切换。**
+What gets mounted is still the real card; `vainfo`, `sycl-ls`, OpenVINO all work normally.
+**No exposure needed, no waiting for a state switch.**
 
-**宿主机命令（租约包装）**
+**Host commands (lease wrapper)**
 
 ```bash
 gpu-run ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD129 -i in.mp4 out.mp4
 ```
 
-申请租约 → 等节点出现在 `/dev/dri` → 执行 → 释放。退出码原样透传，
-`INT/TERM/HUP` 都兜底释放，`kill -9` 交给看护进程。
+Acquire lease → wait for the node to appear in `/dev/dri` → run → release. Exit codes pass
+through unchanged, `INT/TERM/HUP` all release as a fallback, and `kill -9` is handled by the
+watchdog process.
 
-配一个 `gpu-check.sh` 做接入自检：设备映射对不对、设备号是不是本卡（不是核显）、
-`DRM_IOCTL_VERSION` 通不通、面板能不能看见。**设备号这一步最容易错**——容器里 `stat` 出来的是
-十六进制（如 `e2:81`），宿主机 `ls -l` 看到的是十进制（`226:129`），两种写法都要认。
+Pair it with `gpu-check.sh` for access self-checks: correct device mapping, device number
+matching this card (not the iGPU), `DRM_IOCTL_VERSION` working, and dashboard visibility.
+**The device number is the easiest step to get wrong** — inside a container `stat` prints hex
+(`e2:81`) while `ls -l` on the host prints decimal (`226:129`); both forms must be accepted.
 
 ---
 
-## 9. L5 · 观测：监控本身会伤功耗
+## 9. L5 · Observe: monitoring itself hurts power
 
-这条是我踩得最疼的坑。
+This is the trap that hurt most.
 
-无人持卡时设备处于 runtime suspend，**高频读 `hwmon` 会把它反复唤醒**：
+When no one holds the card, the device sits in runtime suspend, and **frequent `hwmon` reads
+keep waking it up**:
 
-| 读法 | 实测功耗 |
+| Read pattern | Measured power |
 |---|---|
-| 只读首尾两次（60 s 端点差分） | 12.0 W |
-| 每 0.5 s 读一次 | **31 W**（而且很稳定，std 0.09） |
+| Only first and last read (60 s endpoint delta) | 12.0 W |
+| One read every 0.5 s | **31 W** (and very stable, std 0.09) |
 
-也就是说，"为了看功耗而加的监控"把功耗从 12 W 抬到了 31 W，而且看起来还很稳定、很有说服力。
+In other words, "monitoring added to observe power" pushed consumption from 12 W to 31 W, and
+the result looked stable and convincing while doing it.
 
-解法是**自适应采样**：有人持卡时 2 s 一次，无人持卡时 15 s 一次，落库用能量区间均值。
-面板上那条曲线要标注采样策略，否则读者会以为设备在抖。
+The fix is **adaptive sampling**: 2 s intervals while someone holds the card, 15 s when idle,
+and store energy-interval means rather than instantaneous values. The dashboard curve must
+state its sampling policy, or readers will conclude the device is oscillating.
 
-顺带回答一个常见疑问："功耗曲线在 0 – 43 W 之间跳，是不是没做好？"
-——不是。真实均值很稳，跳的是采样窗。用 15 s 区间均值，读数在 8.0 – 8.6 W 之间，波动 < 0.6 W。
-
----
-
-## 10. 诊断决策树
-
-拿到一台"待机功耗降不下来"的机器，按这个顺序走，不要跳步：
-
-```
-① lspci -vv 看根端口 LnkCap
-   ├─ 没有 ASPM L1  → 固件层问题，去 BIOS（第 4 节）
-   └─ 有 ASPM L1
-        ↓
-② 看上游 LnkCtl 是否 Enabled
-   ├─ 否 → BIOS 里 PEG ASPM 还是 Auto/Disabled
-   └─ 是
-        ↓
-③ 读 *residenc*，10 s 内 L1 驻留是否增长
-   ├─ 不增长 → 有东西在周期性碰它，进 ④
-   └─ 增长但功耗不降 → 链路睡了、封装没睡，看 pkg 驻留；这是显存地板，属正常上限
-        ↓
-④ 列 clients，逐 pid 看 fdinfo 的 drm-engine-*
-   ├─ 引擎计数为 0 → "仅识别"，是它打断了 L1
-   └─ 引擎计数 > 0 → 真在干活，功耗高是应该的
-        ↓
-⑤ 二分验证
-   - systemctl stop 掉可疑服务，看 L1 驻留是否恢复
-   - 或直接 mv 节点，看是否立刻改善
-```
-
-实测这套走完一般 20 分钟能定位到具体是哪个服务。
+Which answers a common question: "my power curve jumps between 0 and 43 W — is it broken?" No.
+The true mean is stable; the sampling window is what jumps. With 15 s interval means, readings
+sit between 8.0 and 8.6 W, variation under 0.6 W.
 
 ---
 
-## 11. 不同英特尔显卡的适配
+## 10. Diagnostic decision tree
 
-| 类别 | 代表型号 | 驱动 | 独立 VRAM | 浅睡地板 | 对轮询敏感 | 本方案收益 |
+Given a machine whose idle power won't come down, follow this order without skipping steps:
+
+```
+① lspci -vv, check root port LnkCap
+   ├─ no ASPM L1  → firmware-layer problem, go to BIOS (§4)
+   └─ ASPM L1 present
+        ↓
+② is upstream LnkCtl Enabled?
+   ├─ no → BIOS still has PEG ASPM at Auto/Disabled
+   └─ yes
+        ↓
+③ read *residenc*, does L1 residency grow within 10 s?
+   ├─ no → something is touching it periodically, go to ④
+   └─ grows but power doesn't drop → link sleeps, package doesn't; check pkg residency.
+     This is the VRAM floor and is a normal ceiling
+        ↓
+④ list clients, per-pid check fdinfo's drm-engine-*
+   ├─ engine time 0 → merely enumerating; this is what breaks L1
+   └─ engine time > 0 → real work; high power is expected
+        ↓
+⑤ bisect
+   - systemctl stop the suspicious service, see if residency recovers
+   - or just mv the nodes and see if it improves immediately
+```
+
+In practice this identifies the specific service in about 20 minutes.
+
+---
+
+## 11. Fit across Intel GPUs
+
+| Class | Examples | Driver | Dedicated VRAM | Shallow-sleep floor | Sensitive to polling | Gain from this stack |
 |---|---|---|---|---|---|---|
-| DG2 消费 | Arc A310 / A380 / A580 / A750 / A770 | `i915`（新内核可试 `xe`） | 有 | 中 | 高 | 高 |
-| DG2 专业 | Arc Pro A40 / A50 / A60 | 同上 | 有 | 中 | 高 | 高 |
-| BMG 消费 | Arc B570 / B580 | `xe` | 有 | 中–高 | 高 | 很高 |
-| BMG 专业 | Arc Pro B50 / **B60** | `xe` | 有（B60 = 24 GB） | **高**（约 15.6 W） | 高 | **很高（实测 −83%）** |
-| Xe2 核显 | Lunar Lake / Arrow Lake 集显 | `xe` | 共享内存 | 极低 | 中 | 低，不建议 |
-| Xe-LP 核显 | Tiger Lake / Alder Lake / Raptor Lake | `i915` | 共享内存 | 极低 | 中 | 低，不建议 |
+| DG2 consumer | Arc A310 / A380 / A580 / A750 / A770 | `i915` (`xe` worth trying on newer kernels) | Yes | Medium | High | High |
+| DG2 pro | Arc Pro A40 / A50 / A60 | same | Yes | Medium | High | High |
+| BMG consumer | Arc B570 / B580 | `xe` | Yes | Medium–high | High | Very high |
+| BMG pro | Arc Pro B50 / **B60** | `xe` | Yes (B60 = 24 GB) | **High** (~15.6 W) | High | **Very high (−83% measured)** |
+| Xe2 iGPU | Lunar Lake / Arrow Lake integrated | `xe` | Shared memory | Very low | Medium | Low, not advised |
+| Xe-LP iGPU | Tiger Lake / Alder Lake / Raptor Lake | `i915` | Shared memory | Very low | Medium | Low, not advised |
 
-三条经验：
+Three lessons:
 
-1. **显存越大，地板越高**。24 GB 的卡在浅睡时被显存自刷新钉在 15 W 以上，
-   想再往下只能让它进深睡，软件层没有别的空间。
-2. **`xe` 比 `i915` 的观测接口更完整**（有 pkg 域驻留），但名字会变，别写死路径。
-3. **核显不要碰**。它没有独立显存的自刷新问题，且 `/dev/dri` 被显示栈深度依赖，掩藏等于砸显示。
+1. **More VRAM means a higher floor.** A 24 GB card is pinned above 15 W by VRAM self-refresh in
+   shallow sleep; going lower requires deep sleep — there is no software headroom left.
+2. **`xe` exposes more observability than `i915`** (it has package-domain residency), but the
+   names change; don't hardcode paths.
+3. **Leave iGPUs alone.** There is no dedicated-VRAM self-refresh problem to solve, and
+   `/dev/dri` is deeply depended on by the display stack — masking it breaks the display.
 
-> 参考：同款 B60 在评测机上空载 15 – 22 W。差异来自平台（主板/BIOS/CPU 直连方式），
-> 不是卡本身的差别。绝对数字必须自测，方法论可以照搬。
+> For reference: the same B60 idles at 15–22 W in review rigs. The difference comes from the
+> platform (motherboard / BIOS / how the CPU lane is wired), not from the card. Absolute numbers
+> must be measured locally; the methodology transfers.
 
 ---
 
-## 12. 被否决的方案（以及为什么）
+## 12. Rejected approaches (and why)
 
-这一段是给"想找更优雅解法"的人看的——这些我都试过或算过，不必要再走一遍。
+This section is for anyone looking for a more elegant solution — I have either tried or
+calculated each of these, so you don't have to repeat them.
 
-| 方案 | 否决原因 |
+| Approach | Why rejected |
 |---|---|
-| CUSE 假 DRM 节点 | DRM 依赖 `mmap`，CUSE 不支持，第一次 `mmap` 就崩 |
-| 伪造 `/sys/class/drm/` 条目 | sysfs 内核生成，用户态不可写；`libdrm` 也不认假节点 |
-| udev 规则改名 | 只改 `/dev` 名字，改不了枚举结果，且与 `st_rdev ↔ devnum` 校验冲突 |
-| `LD_PRELOAD` 拦截 `open()` | 只影响被注入的进程；系统服务不受控；静态链接程序绕过 |
-| fanotify 拦截 | 需全盘挂载点监控，与 Docker mount namespace 冲突 |
-| BPF LSM 拒绝 `file_open` | 理论可行，但要 `CONFIG_BPF_LSM` + BTF，且 hook 行为随内核漂移 |
-| 驱动打补丁 / 加 quirk | 每次内核升级都要重编，风险与收益不成比例 |
-| `rmmod xe` 卸载模块 | 容器全部失去 GPU；重载还会触发 Battlemage 热复位问题 |
-| 进程内"闲置就卸载模型" | 推理框架的 GPU 上下文是进程级缓存，`gc` 收不回来；实测还导致进程崩溃 |
-| 直接停掉系统服务 | 影响面板功能，升级/重启后会被拉起来，不可持续 |
-| Prometheus + Grafana | 为看一条 8 W 的曲线引入两个服务，运维成本远超收益 |
+| CUSE fake DRM node | DRM depends on `mmap`; CUSE doesn't support it; dies on the first `mmap` |
+| Forged `/sys/class/drm/` entries | sysfs is kernel-generated and not writable from userspace; `libdrm` rejects fake nodes anyway |
+| udev rename rules | Only changes the `/dev` name, not the enumeration result, and conflicts with the `st_rdev ↔ devnum` check |
+| `LD_PRELOAD` intercepting `open()` | Only affects injected processes; system services are out of reach; statically linked binaries bypass it |
+| fanotify interception | Requires monitoring every mount point; conflicts with Docker mount namespaces |
+| BPF LSM denying `file_open` | Theoretically possible, but needs `CONFIG_BPF_LSM` + BTF, and hook behaviour drifts across kernels |
+| Patching the driver / adding a quirk | Requires rebuilding on every kernel upgrade; risk far exceeds reward |
+| `rmmod xe` | All containers lose the GPU; reloading also triggers the Battlemage warm-reset problem |
+| In-process "unload the model when idle" | Inference frameworks cache the GPU context at process level; `gc` can't reclaim it. Measured to crash the process too |
+| Just stopping the system services | Breaks dashboard functionality and they come back after upgrade/reboot — unsustainable |
+| Prometheus + Grafana | Two extra services to watch one 8 W curve; operational cost far exceeds the benefit |
 
 ---
 
-## 13. 落地顺序（一个下午能做完）
+## 13. Rollout order (an afternoon's work)
 
-| 顺序 | 动作 | 耗时 | 风险 |
+| Step | Action | Time | Risk |
 |---|---|---|---|
-| 1 | 记录当前基线：功耗、L1 驻留、clients | 10 min | 无 |
-| 2 | BIOS 设"来电自启" + 冷启验证 | 15 min | 低 |
-| 3 | BIOS 开 PEG ASPM = L1，冷启，跑验收五连 | 30 min | **中**（可能黑屏，需断电冷启） |
-| 4 | 复测功耗，记录新基线 | 10 min | 无 |
-| 5 | 手动 `mv` 节点，观察 10 分钟功耗 | 10 min | 低（可秒回滚） |
-| 6 | 若有效：容器改挂私有路径，部署控制面 | 1 h | 低 |
-| 7 | 观察 24 h：驻留率、曲线、事件流 | — | 无 |
+| 1 | Record the baseline: power, L1 residency, clients | 10 min | None |
+| 2 | BIOS: "Restore AC Power Loss = Power On", verify with a cold boot | 15 min | Low |
+| 3 | BIOS: PEG ASPM = L1, cold boot, run the five-point check | 30 min | **Medium** (may black-screen; needs a power cycle) |
+| 4 | Re-measure power, record the new baseline | 10 min | None |
+| 5 | Manually `mv` the nodes, watch power for 10 minutes | 10 min | Low (instantly reversible) |
+| 6 | If it works: repoint containers to the private path, deploy the control plane | 1 h | Low |
+| 7 | Observe for 24 h: residency, curves, event stream | — | None |
 
-前 5 步不用写一行代码就能验证收益。第 6 步才是工程化。
+The first five steps validate the gain without writing a single line of code. Step 6 is where
+it becomes engineering.
 
 ---
 
-## 14. 复现与仓库结构
+## 14. Reproducing, and repo layout
 
 ```
-docs/01-platform-baseline.md   平台拓扑、功耗构成
-docs/02-bios-aspm.md           BIOS 逐项设置、验收五连、回退
-docs/03-kernel-observation.md  L1 驻留 / pkg 态 / hwmon / fdinfo 的正确读法
-docs/04-node-masking.md        掩藏为什么有效、假节点为什么做不出来
-docs/05-lease-policy.md        状态机、租约、防抖、污染看门狗
-docs/06-integration.md         容器两行接入 + 租约启动器 + 排障
-docs/07-measurement.md         功耗"跳变"的真相与正确测法
-docs/08-tech-stack.md          组件选型与被否决方案
-src/                          控制面（FastAPI + SQLite）
-scripts/                      检测 / 自检 / 租约启动器 / 部署
-templates/                    compose 片段、宿主机用法
+# docs/ = Chinese originals, docs/en/ = English translations (identical structure)
+docs/en/01-platform-baseline.md   platform topology, power breakdown
+docs/en/02-bios-aspm.md           BIOS item-by-item, five-point check, rollback
+docs/en/03-kernel-observation.md  correct reading of L1 residency / pkg state / hwmon / fdinfo
+docs/en/04-node-masking.md        why masking works, why fake nodes can't be built
+docs/en/05-lease-policy.md        state machine, leases, debounce, pollution watchdog
+docs/en/06-integration.md         two-line container access + lease runner + troubleshooting
+docs/en/07-measurement.md         the truth about "jumping" power and how to measure it
+docs/en/08-tech-stack.md          component choices and rejected approaches
+src/                           control plane (FastAPI + SQLite)
+scripts/                       detect / self-check / lease runner / deploy
+templates/                     compose snippet, host-side usage
 ```
 
-快速开始：
+Quick start:
 
 ```bash
-bash scripts/gpu-detect.sh          # 体检：BDF / 节点 / 设备号 / ASPM / 驻留 / 实测功耗
-bash scripts/deploy.sh              # 起控制面（默认端口 41966）
+bash scripts/gpu-detect.sh          # probe: BDF / node / device number / ASPM / residency / live power
+bash scripts/deploy.sh              # start the control plane (default port 41966)
 ```
 
-> 参考实现里的环境变量与路径仍以 `B60_` / `/dev/b60` 命名，因为那是实测对象。
-> 换卡只需改三个值：`B60_BDF`（PCI 地址）、`B60_DRI_NODE` / `B60_RENDER_DEVS`（节点与设备号）、
-> `B60_SERVICES`（哪些服务在轮询）。行为和卡型号无关。
+> The reference implementation still uses `B60_` / `/dev/b60` naming for env vars and paths,
+> because that was the measured card. Switching cards only requires three values:
+> `B60_BDF` (PCI address), `B60_DRI_NODE` / `B60_RENDER_DEVS` (node and device number), and
+> `B60_SERVICES` (which services are polling). Behaviour is independent of the card model.
 
 ---
 
-## 15. 边界与红线
+## 15. Boundaries and red lines
 
-**这套东西解决不了的事：**
+**What this cannot solve:**
 
-- 显存自刷新地板（24 GB 卡浅睡时约 15.6 W）——物理限制，只能靠深睡绕过。
-- 真有负载时的功耗——那不是本方案的目标。
-- 平台/BIOS 不提供 ASPM 能力的机器——只能换平台。
+- The VRAM self-refresh floor (~15.6 W for a 24 GB card in shallow sleep) — a physical limit;
+  only deep sleep routes around it.
+- Power under real load — that isn't the goal here.
+- Platforms/BIOSes that don't offer ASPM capability — replace the platform.
 
-**红线（违反可能要 Clear CMOS 才能救回）：**
+**Red lines (violating these may require Clear CMOS to recover):**
 
-1. 禁开 L1 Substates / L1.1 / L1.2。
-2. 禁一次改多项 BIOS。
-3. 禁 OS 内 `reboot`（Battlemage 热复位黑屏），一切重启走断电 → 等 10 s → 上电。
-4. 改动 BIOS 前必先设"来电自启"。
-5. 掩藏节点前确认没有图形会话/显示器挂在卡上。
+1. Never enable L1 Substates / L1.1 / L1.2.
+2. Never change more than one BIOS item at a time.
+3. Never `reboot` from the OS (Battlemage warm-reset black screen). All restarts go
+   power off → wait 10 s → power on.
+4. Always set "Restore AC Power Loss = Power On" before touching BIOS.
+5. Confirm no graphical session or monitor is attached to the card before masking nodes.
 
-**安全面：**
+**Security posture:**
 
-- 控制面默认无认证，只应监听内网。要暴露到公网，请套反向代理 + 认证。
-- 控制面容器是 `privileged`（要搬 `/dev`、读 debugfs），等于宿主 root，只应部署在受信任的机器上。
-- 本项目不保存任何凭据。
-
----
-
-## 16. 最后
-
-这套方案的本质不是"省电技巧"，而是一个判断：
-
-> **持有设备不阻塞低功耗，周期性打扰才阻塞。**
-
-一旦接受这个判断，方案形态就唯一了——不是拦截 `open()`，不是伪造设备，
-而是把"谁在什么时候可以看见它"变成显式策略。
-
-实测数据来自一台真实在跑的机器（Arc Pro B60 24 GB，无头，只跑容器），
-不是实验室调出来的数字。所有结论都可以用第 10 节的决策树在别的机器上复现。
+- The control plane has no authentication by default and should only listen on a trusted
+  network. For public exposure, put it behind a reverse proxy with auth.
+- The control plane container is `privileged` (it moves `/dev` entries and reads debugfs),
+  which is equivalent to host root. Deploy only on machines you trust.
+- This project stores no credentials.
 
 ---
 
-*License: MIT · 欢迎提 issue 补充其他平台/卡型的实测数据。*
+## 16. Closing
+
+The essence of this approach is not a power-saving trick but a judgement:
+
+> **Holding the device does not block low power. Periodic disturbance does.**
+
+Once you accept that, the shape of the solution becomes the only one available — not
+intercepting `open()`, not forging devices, but turning "who may see it, and when" into an
+explicit policy.
+
+The measurements come from a real machine in production (Arc Pro B60 24 GB, headless,
+container-only), not lab-tuned numbers. Every conclusion can be reproduced elsewhere using the
+decision tree in §10.
+
+---
+
+*License: MIT · Issues with measurements from other platforms and cards are welcome.*
